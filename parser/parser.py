@@ -6,12 +6,14 @@ import pandas as pd
 import glob
 import easyocr
 import spacy
+import re
 import ru_core_news_md
 from spacy.lang.xx import MultiLanguage
 from thefuzz import fuzz
+from sklearn.cluster import OPTICS
 import traceback
 
-from pages import utils
+from common import utils
 
 #----------------------------------------------------------------------
 
@@ -26,6 +28,7 @@ class EmptyResultsException(ParserException):
 spacy.prefer_gpu()
 
 DATA_DIR = utils.absp('parser')
+NL = '\n'
 
 #----------------------------------------------------------------------
 
@@ -43,11 +46,12 @@ class Parser:
     для собственной модели распознавания текста).
     """
 
-    def __init__(self, images=None, langs=['ru', 'en'], on_parse=None,
-                 optimize_duplicates=85, ocr_network=None,
+    def __init__(self, images=None, langs=["ru", "en"], on_parse=None,
+                 optimize_duplicates=70,
                  min_confidence=0, mark_images=True, 
-                 contrast_ths=0.4, adjust_contrast=0.7, 
-                 width_ths=0.55, add_margin=0.02, mag_ratio=1.7, **kwargs):
+                 contrast_ths=0.5, adjust_contrast=1.5, 
+                 width_ths=0.55, add_margin=0.02, mag_ratio=2.5, 
+                 text_threshold=0.6, **kwargs):
         self.images = images
         self.min_confidence = min_confidence
         self.mark_images = mark_images
@@ -55,9 +59,10 @@ class Parser:
         self.optimize_duplicates = optimize_duplicates
         self.ocr_kwargs = kwargs if kwargs else {}
         self.ocr_kwargs.update(dict(contrast_ths=contrast_ths, adjust_contrast=adjust_contrast, 
-                                    width_ths=width_ths, add_margin=add_margin, mag_ratio=mag_ratio))
+                                    width_ths=width_ths, add_margin=add_margin, mag_ratio=mag_ratio,
+                                    text_threshold=text_threshold))
         self.ocr_engine = easyocr.Reader([l for l in langs] if langs else ['ru', 'en'], gpu=True, 
-                                         recog_network=ocr_network or 'standard', # custom OCR neural network
+                                         # recog_network='armfilm', # custom OCR neural network
                                          model_storage_directory=DATA_DIR, user_network_directory=DATA_DIR)
         if 'ru' in langs:
             self.nlp = ru_core_news_md.load() # Russian model (medium)
@@ -76,21 +81,21 @@ class Parser:
         cnt_images = len(self.images)
         for i, imgfile in enumerate(self.images):
             try:
-                blocks, img = self.ocr(imgfile, self.min_confidence, True, self.mark_images, **self.ocr_kwargs)
+                dict_results, img = self.ocr(imgfile, self.min_confidence, True, self.mark_images, **self.ocr_kwargs)
                 imgs.append(img)
-                parsed = self.parse_names(blocks, parsed)
-                if self.on_parse:
-                    self.on_parse(i, cnt_images, imgfile, img, blocks, parsed)
+                for k in dict_results:
+                    parsed = self.parse_names(dict_results[k], parsed)
+                    if self.on_parse:
+                        self.on_parse(i, cnt_images, imgfile, img, dict_results[k], parsed)
             except EmptyResultsException:
-                print(f'Изображение {i+1} / {cnt_images}: текстовые данные не найдены!')
+                # print(f'Изображение {i+1} / {cnt_images}: текстовые данные не найдены!')
                 continue
             except:
                 traceback.print_exc()
                 continue
         if self.optimize_duplicates >= 0 and self.optimize_duplicates < 100:
             parsed, opt_cnt = self.optimize_parsed_names(parsed, self.optimize_duplicates)
-            if opt_cnt:
-                print(f'ИСКЛЮЧЕНО {opt_cnt} ДУБЛИКАТОВ.')
+            # if opt_cnt: print(f'ИСКЛЮЧЕНО {opt_cnt} ДУБЛИКАТОВ.')
         return (self.parsed_to_df(parsed), imgs)
 
     def make_training_dataset(self, dataset_name, save_dir=DATA_DIR, images=None):
@@ -122,15 +127,16 @@ class Parser:
         counter = 0
         for imgfile in images:
             try:
-                blocks, img = self.ocr(imgfile, self.min_confidence, False, False, **self.ocr_kwargs)
-                for _, row in blocks.iterrows():
-                    outfile = f'{counter:05}_{dataset_name}.jpg'
-                    cropped = img[row.tl_y:row.bl_y, row.tl_x:row.tr_x]
-                    cv2.imwrite(os.path.join(dspath, outfile), cropped)
-                    pairs.append((outfile, row.text))
-                    counter += 1
+                dict_results, img = self.ocr(imgfile, self.min_confidence, False, False, **self.ocr_kwargs)
+                for k in dict_results:
+                    for _, row in dict_results[k].iterrows():
+                        outfile = f'{counter:05}_{dataset_name}.jpg'
+                        cropped = img[row.tl_y:row.bl_y, row.tl_x:row.tr_x]
+                        cv2.imwrite(os.path.join(dspath, outfile), cropped)
+                        pairs.append((outfile, row.text))
+                        counter += 1
             except EmptyResultsException:
-                print(f'Изображение "{imgfile}": текстовые данные не найдены!')
+                # print(f'Изображение "{imgfile}": текстовые данные не найдены!')
                 continue
             except:
                 traceback.print_exc()
@@ -194,46 +200,58 @@ class Parser:
             raise EmptyResultsException()
 
         lres = len(results)
-        results['tag'] = [''] * lres
-
-        # убрать лишние блоки
-        results = self.clean_blocks_heur(results)
-        if results is None:
-            raise EmptyResultsException()        
+        results['tag'] = [''] * lres                
 
         # объединить соседние блоки
         results = self.chain_blocks_heur(results)
 
-        # кластеризация по "строкам", чтобы читать сверху вниз и слева направо
-        results = self.cluster_blocks_heur(results)
+        # убрать лишние блоки
+        results = self.clean_blocks_heur(results)
+        if results is None:
+            raise EmptyResultsException()
 
-        if detect_names:
-            # определить тип текста: фамилия / имя или нечто другое
-            lres = len(results)          
-            for i in range(lres):
-                txt = results.iat[i, 10]
-                while '  ' in txt:
-                    txt = txt.replace('  ', ' ')
-                spl = txt.split(' ')
-                if len(spl) > 1 and all(c[0] == c[0].upper() for c in spl if c):
-                    results.iat[i, 12] = 'name'
-                    continue
-                doc = self.nlp(txt)
-                for ent in doc.ents:
-                    if ent.label_ == 'PER':
-                        results.iat[i, 12] = 'name'
-                        break
-   
+        # разбиение блоков на кластеры, отделенные пустыми местами
+        dict_results = self.split_blocks_heur(results)
+
         img1 = img.copy()
-        if mark_image:     
-            img_shapes = img1.copy()
-            alpha = 0.5
-            for row in results.itertuples(False):
-                color = (230, 230, 50) if row.tag == 'name' else (230, 50, 50)
-                cv2.rectangle(img_shapes, (row.tl_x, row.tl_y), (row.br_x, row.br_y), color, -1)
-            cv2.addWeighted(img_shapes, alpha, img1, 1 - alpha, 0, img1)
 
-        return (results, img1)
+        # итерация по всем найденным кластерам
+        for k in dict_results:
+            # кластеризация по "строкам", чтобы читать сверху вниз и слева направо
+            dict_results[k] = self.cluster_blocks_heur(dict_results[k])
+
+            if detect_names:
+                # определить тип текста: фамилия / имя или нечто другое
+                lres = len(dict_results[k])          
+                for i in range(lres):
+                    txt = dict_results[k].iat[i, 10]
+                    while '  ' in txt:
+                        txt = txt.replace('  ', ' ')
+                    if txt != txt.lower() and txt != txt.upper() and re.fullmatch(r'[\w\s\.\-]+', txt, re.I):
+                        spl = txt.split(' ')
+                        if len(spl) > 1:
+                            if all(c[0] == c[0].upper() for c in spl if c):
+                                dict_results[k].iat[i, 12] = 'name'
+                            continue
+                    doc = self.nlp(txt)
+                    for ent in doc.ents:
+                        if ent.label_ == 'PER':
+                            dict_results[k].iat[i, 12] = 'name'
+                            break   
+            
+            if mark_image:     
+                img_shapes = img1.copy()
+                alpha = 0.5
+                for row in dict_results[k].itertuples(False):
+                    color = (230, 230, 50) if row.tag == 'name' else (230, 50, 50)
+                    cv2.rectangle(img_shapes, (row.tl_x, row.tl_y), (row.br_x, row.br_y), color, -1)
+                cv2.addWeighted(img_shapes, alpha, img1, 1 - alpha, 0, img1)
+                cv2.rectangle(img1, 
+                              (dict_results[k].tl_x.min() - 5, dict_results[k].tl_y.min() - 5), 
+                              (dict_results[k].br_x.max() + 5, dict_results[k].br_y.max() + 5), 
+                              (0, 50, 200), 2)
+
+        return (dict_results, img1)
 
     def clean_blocks_heur(self, blocks):
         """
@@ -242,9 +260,9 @@ class Parser:
         # Убираем блоки, не содержащие букв, а также длиной менее 2 символов
         blocks = blocks.loc[(blocks.text.str.contains(r'\w', False)) & (blocks.text.str.len() > 2)]
         if len(blocks) == 0: return None
-        # Вычисляем наиболее частую высоту блока (строки) и удаляем блоки, превышающие 1.5 значения
+        # Вычисляем наиболее частую высоту блока (строки) и оставляем блоки высотой от 70 до 130% от среднего 
         mode_ht = blocks.ht.mode().iat[0]
-        blocks = blocks.loc[blocks.ht <= (1.5 * mode_ht)]
+        blocks = blocks.loc[(blocks.ht <= (1.3 * mode_ht)) & (blocks.ht >= (0.7 * mode_ht))]
 
         return blocks.copy()
 
@@ -287,15 +305,80 @@ class Parser:
 
         return blocks.copy()
 
-    def split_blocks_heur(self, blocks, vertical=2.0, horizontal=3.0):
+    def _rect_distance(self, rect1, rect2):
+        (x1, y1, x1b, y1b) = rect1
+        (x2, y2, x2b, y2b) = rect2
+        left = x2b < x1     # rect2 слева от rect1
+        right = x1b < x2    # rect2 справа от rect1
+        bottom = y2b < y1   # rect2 выше rect1
+        top = y1b < y2      # rect2 ниже rect1
+        if top and left:
+            return max((x1 - x2b), (y2 - y1b))
+        elif left and bottom:
+            return max((x1 - x2b), (y1 - y2b))
+        elif bottom and right:
+            return max((x2 - x1b), (y1 - y2b))
+        elif right and top:
+            return max((x2 - x1b), (y2 - y1b))
+        elif left:
+            return x1 - x2b
+        elif right:
+            return x2 - x1b
+        elif bottom:
+            return y1 - y2b
+        elif top:
+            return y2 - y1b
+        else:             # совпадение или пересечение прямоугольников
+            return 0
+
+    def split_blocks_heur(self, blocks, max_dist=1.2, log=None):
         """
         Разбивает исходные данные (блоки) на группы блоков, разделенные по
         минимальному расстоянию по вертикали и/или горизонтали.
-        Возвращает список датафреймов, отсортированный по координатам (tl_x, tl_y).
+        Возвращает словарь датафреймов, каждый из которых представляет собой 
+        кластер из блоков.
         """
-        pass
+        logfile = open(os.path.join(DATA_DIR, log), 'w', encoding='utf-8') if log else None
 
-    def cluster_blocks_heur(self, blocks, vertical=0.25, horizontal=0.2):
+        # обычная высота блока
+        blocks = blocks.copy()
+        if log: print(f'BLOCKS:{NL}{blocks.to_string()}{NL*2}', file=logfile)
+
+        mode_ht = blocks.ht.mode().iat[0]
+        max_dist = float(mode_ht) * max_dist
+
+        if log: print(f'Avg height={mode_ht}, Max dist={mode_ht}{NL*2}', file=logfile)
+
+        # вычислить матрицу расстояний с помощью собственной функции
+        try:
+            dist_matrix = np.array([[self._rect_distance((row1.tl_x, row1.tl_y, row1.br_x, row1.br_y), 
+                                                        (row2.tl_x, row2.tl_y, row2.br_x, row2.br_y))
+                                    for row2 in blocks.itertuples(False)] 
+                                    for row1 in blocks.itertuples(False)], dtype=np.int16)
+            if log: print(f'DIST MATRIX:{NL}{pd.DataFrame(dist_matrix).to_string()}{NL*2}', file=logfile)
+            
+            # применим алгоритм кластеризации OPTICS: https://scikit-learn.org/stable/modules/generated/sklearn.cluster.OPTICS.html
+            blocks['cluster'] = OPTICS(min_samples=2,              # мин. количество блоков в одном кластере = 2
+                                       metric='precomputed',       # метрика указана 'precomputed' = использовать матрицу расстояний
+                                       max_eps=max_dist,           # макс. расстояние для выделения кластеров
+                                       cluster_method='dbscan').fit_predict(dist_matrix)  # алгоритм = DBSCAN
+
+            if log: print(f'BLOCKS (BEFORE OUTLIER INDEXING):{NL}{blocks.to_string()}{NL*2}', file=logfile)
+
+            # пронумеруем отавшиеся блоки-одиночки, которые не были включены ни в один кластер
+            m = blocks['cluster'].max()
+            ln = len(blocks.loc[blocks['cluster'] == -1, 'cluster'])
+            if ln:
+                blocks.loc[blocks['cluster'] == -1, 'cluster'] = list(range(m + 1, m + 1 + ln))
+
+            if log: print(f'BLOCKS (AFTER OUTLIER INDEXING):{NL}{blocks.to_string()}{NL*2}', file=logfile)
+
+        finally:
+            if log: logfile.close()
+
+        return dict(tuple(blocks.groupby('cluster')))
+
+    def cluster_blocks_heur(self, blocks, max_dist=0.25):
         """
         Выделение строк и столбцов среди блоков, определение выравнивания
         для дальнейшего решения о том, с какой стороны теги (роли), с какой - имена.
@@ -308,7 +391,7 @@ class Parser:
         blocks['row'] = np.full(len(blocks), -1, dtype=np.int16)
 
         # макс. отклонение по вертикали для поиска блоков в строке (25% от высоты блока)
-        max_dist = round(mode_ht * vertical)
+        max_dist = float(mode_ht) * max_dist
 
         # вычисляем номера строк для всех блоков
         i = 0
@@ -378,7 +461,7 @@ class Parser:
         # применим простое правило: сверху/слева - тег, справа/снизу - имя
         tags = []
         for _, drow in blocks.iterrows():
-            # если наши блок, определенный как ФИО
+            # если нашли блок, определенный как ФИО
             if drow.tag == 'name':
                 # если есть накопленные выше теги
                 if tags:
@@ -398,18 +481,23 @@ class Parser:
                     # если тег не нашли, будет None
                     parsed.append([tag, drow.text])
             else:
-                tags.append(drow.text)       
+                tags.append(drow.text)
+
+        # может быть, что последний (или единственный) блок - это тег;
+        # тогда добавляем его с именем = None
+        if tags:
+            parsed.append([' '.join(tags), None])
 
         return parsed
 
-    def optimize_parsed_names(self, parsed, match_cutoff=85):
+    def optimize_parsed_names(self, parsed, match_cutoff=70):
         """
         Оптимизация финальной таблицы с тегами и именами:
         - удаление дублирующихся пар
         """
         if (match_cutoff is None) or (match_cutoff < 0) or (match_cutoff > 100):
             return (parsed, 0)
-        parsed1 = [el + [True] for el in parsed]
+        parsed1 = [[l or '' for l in el] + [True] for el in parsed]
         lp = len(parsed1)
         for i in range(lp):
             if not parsed1[i][-1]: continue
@@ -432,7 +520,7 @@ class Extractor:
         except:
             return False
 
-    def __init__(self, uri, datadir, parser=None, unique_id=None, 
+    def __init__(self, uri, datadir=DATA_DIR, parser=None, unique_id=None, 
                  on_download=None, on_extract=None, on_parse=None):
         self.videofile = uri
         self.datadir = datadir        

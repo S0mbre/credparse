@@ -3,8 +3,8 @@
 from os import path
 import sqlite3
 import re
-from numpy import record
 import pandas as pd
+import uuid
 
 #-------------------- CONST --------------------
 NL = '\n'
@@ -27,11 +27,14 @@ DROP TABLE IF EXISTS names;
 
 CREATE TABLE projects (
     id_proj INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT,
     title TEXT DEFAULT '',
     year INTEGER DEFAULT NULL,
     url TEXT DEFAULT '', 
-    cred_start INTEGER DEFAULT 0,
-    cred_end INTEGER DEFAULT 0,
+    language TEXT DEFAULT 'Русский',
+    cred_start INTEGER DEFAULT -1,
+    cred_end INTEGER DEFAULT -1,
+    cred_sample INTEGER DEFAULT 1,
     status TEXT DEFAULT ''
 );
 
@@ -158,9 +161,11 @@ class tsqlite():
         self.__chunkflag = bool(res)            
         return res
 
-    def asdataframe(self, sql):
+    def asdataframe(self, sql, startcol=0, endcol=None, columns=None):
         records = self.select(sql, fieldnames=True)
-        return pd.DataFrame.from_records(records[1:] if len(records) > 1 else [], columns=records[0])
+        if startcol is None or startcol < 0: 
+            startcol = 0
+        return pd.DataFrame.from_records(records[startcol:endcol] if len(records) > 1 else [], columns=columns or records[0])
 
     def _get_column_names(self, cur):
         return tuple(c.name for c in cur.description) if cur else tuple()
@@ -173,9 +178,9 @@ class Credb(tsqlite):
         super().__init__('db/data.db')
 
     def get_projects_df(self):
-        return self.asdataframe(SQL_GETPROJECTS)
+        return self.asdataframe(SQL_GETPROJECTS, 1, columns=['UID', 'Название', 'Год', 'URL', 'Язык', 'Начало', 'Конец', 'Интервал', 'Статус'])
 
-    def add_project(self, title, year, url, cred_start, cred_end, status):
-        sql = 'insert into projects values (?, ?, ?, ?, ?, ?)'
-        self.SQL_CUR.execute(sql, (title, year, url, cred_start, cred_end, status))
+    def add_project(self, title, year, url, language, cred_start, cred_end, cred_sample, status):
+        sql = 'insert into projects values (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        self.SQL_CUR.execute(sql, (uuid.uuid4().hex, title, year, url, language, cred_start, cred_end, cred_sample, status))
         self.SQL_CON.commit()
