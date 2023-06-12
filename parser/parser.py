@@ -612,7 +612,6 @@ class Extractor:
             nonlocal images
             imfile = os.path.join(self.datadir, f'{self.id}_{n:05}_frame_{cur_frame:.0f}_{cur_time:.0f}ms.jpg')
             cv2.imwrite(imfile, img)
-            # print(f'EXTRACTED FRAME {n} ==> "{imfile}"')
             if self.on_extract:
                 self.on_extract(img, n, cur_time, cur_frame)
             images.append(imfile)
@@ -623,7 +622,6 @@ class Extractor:
         images = []
         def callback(img, n, cur_time, cur_frame):
             nonlocal images
-            # print(f'EXTRACTED FRAME {n}')
             if self.on_extract:
                 self.on_extract(img, n, cur_time, cur_frame)
             images.append(img)
@@ -638,4 +636,4 @@ class Extractor:
         self.parser.images = images
         if kwargs:
             self.parser.ocr_kwargs.update(kwargs)
-        return self.parser.parse() # dfparsed, imgs
+        return self.parser.parse()
